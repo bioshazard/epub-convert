@@ -1,124 +1,113 @@
 # epub-convert
 
-Python API and CLI for the EPUB → HTML → Markdown → cleaned Markdown workflow in
-`../iooh-epub/convert-epub-md`. Conversion runs locally, without an LLM or a hosted service.
+Reading-ready Markdown from EPUBs, as a CLI, Python function, or HTTP API.
+No LLM, network service, or extracted book assets.
 
 ## Run
 
-Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and Pandoc with `--sandbox`
-support. Tested with Python 3.12.13 and Pandoc 3.1.3.
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/) and
+[Pandoc](https://pandoc.org/) 3.12.1 (`brew install pandoc` on macOS;
+`sudo apt install pandoc` only if the distribution provides version 3.12.1).
 
 ```sh
-sudo apt install pandoc  # Linux; macOS: brew install pandoc
 uv sync --locked
+uv run epub-convert convert book.epub -o book.md
+uv run epub-convert convert book.epub > book.md
+cat book.epub | uv run epub-convert convert -
 uv run epub-convert serve
 ```
 
-The API listens on `http://127.0.0.1:3000`. Interactive upload docs: `/docs`.
-Use `--host 0.0.0.0 --port 3000` to listen on other interfaces, or set `HOST` and `PORT`.
-There is no authentication; the default bind is local. `PANDOC_BIN` can select a specific
-Pandoc installation. `uv.lock` pins Python dependencies; install the same Pandoc version
-when byte-for-byte output across deployments matters.
-
-## Convert
+The API defaults to `http://127.0.0.1:3000`; interactive upload docs are at `/docs`.
+`serve --host 0.0.0.0 --port 3000` changes its bind. `HOST`, `PORT`, and
+`PANDOC_BIN` are optional overrides. No authentication is built in.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:3000/convert \
-  -F 'file=@../iooh-epub/convert-epub-md/artifacts/To Sell Is Human.epub' \
-  -o book.md
-
+  -F 'file=@book.epub' -o book.md
 # Raw EPUB bodies work too.
 curl --fail-with-body http://127.0.0.1:3000/convert \
   -H 'Content-Type: application/epub+zip' --data-binary @book.epub -o book.md
-
-# The identical pipeline is available without a running server.
-uv run epub-convert convert book.epub -o book.md
 ```
 
-`POST /convert` returns UTF-8 `text/markdown` with an attachment filename and
-`X-Conversion-Pipeline: iooh-epub-v1`. Multipart uploads take exactly one `file`.
-Raw `application/octet-stream` is also accepted. `GET /health` reports readiness
-after startup has checked dependencies. `/openapi.json` describes the API.
+```python
+from epub_convert import convert_epub
 
-## Baked-in conversion
+markdown = convert_epub(epub_bytes)
+```
 
-The three source steps run in the original order:
+All three interfaces return the same Markdown. Conversion failures leave an
+existing CLI output file untouched. CLI diagnostics go to stderr.
 
-1. `src/00-pandoc.sh`: Pandoc reads the EPUB in its reading order and writes HTML.
-   The API uses local Pandoc with `--sandbox`, rather than the source script's
-   unpinned `pandoc/latex` Docker image. Its default HTML wrapping is preserved.
-2. `src/01-main.py`: `markdownify==0.14.1` renders that HTML with
-   `heading_style="ATX"`, including pipe tables. All five Python converter
-   dependency versions match the source `uv.lock`.
-3. `src/02-double-newline.py`: the same three regular expressions, in the same
-   order, join wrapped lines while preserving table rows, turn a leading space
-   into a newline, and replace Markdown hyperlinks with their visible text.
+## The Markdown contract
 
-The cleanup is preserved literally, including whitespace. It is intended for the
-source's reading/audiobook workflow: link destinations are discarded, list/code
-formatting can flatten, and complex nested links inherit the source regex's
-limitations. Image syntax and relative references follow the original behavior;
-the response does not bundle image assets. No additional typography rewriting,
-paragraph heuristics, trimming, or summarization is applied.
+- Book/spine reading order, headings, paragraphs, emphasis and Unicode survive.
+- Each ordinary paragraph occupies one source line; real paragraph boundaries,
+  lists, quotations, code indentation and footnotes remain structural.
+- Links retain their formatted labels; destinations are removed.
+- Images become alt text; assets are not extracted or bundled. There is no OCR.
+- Tables remain pipe tables, including captions and merged-cell placement.
+  Multi-paragraph/list cells are flattened with word boundaries intact; spanned
+  continuation cells are empty because pipe tables cannot express merged cells.
+- Code uses fences; presentation wrappers, raw HTML and script/style content are
+  excluded. Subscript/superscript retain their text without HTML wrappers.
 
-## Limits and failures
+The engine reads the EPUB into Pandoc's document tree, applies the small bundled
+`reading.lua` policy, and writes Markdown with wrapping disabled. It never turns
+finished Markdown back into prose with regexes. There are no worker scripts or
+intermediate HTML/Markdown files. See [the design and evidence](docs/conversion.md).
 
-- 64 MiB per EPUB; 65 MiB total request including multipart overhead, enforced
-  while reading even without `Content-Length`.
-- ZIP validation: EPUB mimetype and package document, at most 10,000 entries and
-  256 MiB declared expanded size; encrypted ZIP entries are rejected. Archives
-  are never extracted by application code.
-- Two conversions at a time per server process. Extra requests get `503` with
-  `Retry-After: 5`. Pandoc runs with sandboxing; each subprocess has a 120-second
-  timeout. Each request has its own temporary directory, removed on success or failure.
-- `400`: empty/malformed upload; `413`: size limit; `415`: content type;
-  `422`: invalid, unreadable, empty, or unsupported EPUB; `504`: conversion timeout.
-  Conversion errors return JSON with `error` and `message`.
+Pipeline identifier: `reading-markdown-v1` (`X-Conversion-Pipeline` response header).
+The former v0.1 image remains available; this changes document serialization, so
+historical whitespace is not the compatibility contract.
 
-## Verify
+## API behavior and limits
+
+`POST /convert` accepts exactly one multipart `file`, or a raw
+`application/epub+zip` / `application/octet-stream` body. Success is UTF-8
+`text/markdown` with an attachment filename and `Cache-Control: no-store`.
+`GET /health` becomes ready after checking Pandoc; `/openapi.json` documents uploads.
+
+- 64 MiB per EPUB; 65 MiB total request, enforced while streaming without relying
+  on `Content-Length`.
+- ZIP validation before conversion: EPUB mimetype/package document, at most
+  10,000 entries and 256 MiB declared expanded size; duplicate/encrypted entries
+  and oversized/entity-bearing container XML are rejected. No archive extraction.
+- Pandoc is version-checked (3.12.1) and uses `--sandbox` and a 120-second timeout. API admission is capped at two
+  conversions per process; excess requests receive `503`, `Retry-After: 5`.
+- JSON failures use `{error,message}`: `400` malformed/empty upload, `413` size,
+  `415` content type, `422` invalid/unreadable/empty book, `504` timeout.
+
+## Check it
 
 ```sh
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
-uv run python scripts/verify_source.py
-# Optional alternate source conversion directory:
-uv run python scripts/verify_source.py /path/to/iooh-epub/convert-epub-md
+uv run python scripts/verify_books.py /private/books --evidence /private/evidence
 ```
 
-The verification command runs all source EPUBs through the API, independently
-runs the original `01-main.py` and `02-double-newline.py` after Pandoc, and
-requires byte-for-byte agreement. It also checks the three stored HTML artifacts
-against the original scripts to isolate the Python stages from Pandoc versions.
-It saves converted books and a SHA-256/size/timing report in
-`artifacts/verification/` (gitignored). Source books and scripts are never modified.
-
-All four source EPUBs match fresh execution of the original scripts byte for byte.
-Three also match the historical clean Markdown exactly. The saved HTML for
-`age-of-invisible-machines-ed2.epub` has empty endnote sections and footnote entries;
-fresh Pandoc includes those notes, producing 633,493 bytes versus the historical
-612,935 bytes. Running either implementation against the saved HTML reproduces
-the historical output. The scripts do not record a note-removal step, so the API
-preserves the notes Pandoc produces. Historical-file agreement is reported
-separately from agreement with the executable source pipeline.
+The real-book audit checks source document text/order against parsed output and
+requires library, CLI and API bytes to agree. It saves protected Markdown/hashes
+outside the repository. It never needs the old scripts or historical artifacts.
+The tests use self-authored EPUBs, including nested lists, code, tricky link
+labels, Unicode, merged/multiline tables, invalid input and concurrent requests.
 
 ## Container image
-
-GitHub Actions tests the image and a real HTTP conversion before publishing
-`ghcr.io/bioshazard/epub-convert` for `linux/amd64` and `linux/arm64`.
-Release tags publish `v0.1.0`, `0.1.0`, SHA and `latest` tags (with the
-version taken from each tag). Main pushes and pull requests test without
-publishing. Base images and Actions are pinned by digest/commit.
 
 ```sh
 docker build -t epub-convert:local .
 python3 scripts/smoke_image.py epub-convert:local
 docker run --rm --read-only --tmpfs /tmp:rw,nosuid,noexec,size=256m \
   --cap-drop=ALL --security-opt=no-new-privileges \
-  -p 127.0.0.1:3000:3000 ghcr.io/bioshazard/epub-convert:v0.1.0
+  -p 127.0.0.1:3000:3000 epub-convert:local
 ```
 
-The runtime includes Pandoc, runs as UID/GID 10001, and uses temporary request
-storage only. Bind the host port to loopback unless placing it behind your own
-authenticating gateway. Private GHCR packages require `docker login ghcr.io`.
-The Docker build context allowlist excludes credentials and book artifacts.
+The image includes Pandoc and runs as UID/GID 10001. Its root filesystem can be
+read-only; multipart upload buffering may use `/tmp`. Bind the host port to
+loopback unless using your own authenticating gateway.
+
+GitHub Actions runs tests and an actual container HTTP conversion before publishing
+`ghcr.io/bioshazard/epub-convert` for amd64 and arm64. Main/PR builds test;
+`vX.Y.Z` tags publish versioned images and `latest`, and must match the package
+version. Base images and Actions are pinned by digest/commit. Build context is an
+allowlist that excludes credentials and private book artifacts.

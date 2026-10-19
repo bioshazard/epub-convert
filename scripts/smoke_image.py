@@ -63,7 +63,7 @@ def main():
             base + "/convert", data=epub, headers={"Content-Type": "application/epub+zip"}
         )
         with urllib.request.urlopen(request, timeout=30) as response:
-            assert response.headers["X-Conversion-Pipeline"] == "iooh-epub-v1"
+            assert response.headers["X-Conversion-Pipeline"] == "reading-markdown-v1"
             assert "A synthetic conversion check." in response.read().decode()
         print(
             json.dumps(

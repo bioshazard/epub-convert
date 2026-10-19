@@ -1,19 +1,14 @@
 [project]
 name = "epub-convert"
-version = "0.1.0"
-description = "EPUB to Markdown API preserving the iooh-epub conversion pipeline"
+version = "0.2.0"
+description = "Reading-ready EPUB to Markdown, as a CLI and HTTP API"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
     "python-multipart>=0.0.20,<1",
-    # Exact versions from iooh-epub/convert-epub-md/uv.lock.
-    "markdownify==0.14.1",
-    "beautifulsoup4==4.13.3",
-    "six==1.17.0",
-    "soupsieve==2.6",
-    "typing-extensions==4.12.2",
+
 ]
 
 [dependency-groups]

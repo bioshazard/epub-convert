@@ -4,6 +4,7 @@
 !README.md
 !epub_convert/
 !epub_convert/*.py
+!epub_convert/*.lua
 !tests/
 !tests/*.py
 !scripts/

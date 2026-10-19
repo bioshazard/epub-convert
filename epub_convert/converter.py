@@ -1,86 +1,123 @@
+"""One conversion contract: EPUB bytes in, reading Markdown out."""
+
 import os
+import re
 import shutil
 import subprocess
-import sys
-from importlib.metadata import version
+import zipfile
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from xml.etree import ElementTree
 
-PIPELINE = "iooh-epub-v1"
+PIPELINE = "reading-markdown-v1"
+PANDOC_VERSION = (3, 12, 1)
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
-STAGE_TIMEOUT_SECONDS = 120
-WORKER = Path(__file__).with_name("worker.py")
+CONVERSION_TIMEOUT_SECONDS = 120
+FILTER = Path(__file__).with_name("reading.lua")
 
 
 class ConversionError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    """An expected conversion failure, independent of HTTP or command-line exits."""
+
+    def __init__(self, code: str, message: str):
         super().__init__(message)
-        self.status = status
         self.code = code
 
 
+@lru_cache(maxsize=4)
+def _checked_engine(executable: str) -> str:
+    try:
+        result = subprocess.run([executable, "--version"], capture_output=True, timeout=5)
+        match = re.match(rb"pandoc (\d+)\.(\d+)\.(\d+)", result.stdout)
+        if result.returncode or not match or tuple(map(int, match.groups())) != PANDOC_VERSION:
+            raise ConversionError(
+                "engine_unavailable", "Pandoc 3.12.1 is required for validated output."
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConversionError("engine_unavailable", "Pandoc could not start.") from exc
+    return executable
+
+
 def pandoc_bin() -> str:
-    return os.environ.get("PANDOC_BIN", "pandoc")
+    executable = shutil.which(os.environ.get("PANDOC_BIN", "pandoc"))
+    if not executable:
+        raise ConversionError("engine_unavailable", "Pandoc is missing. Install Pandoc 3.12.1.")
+    return _checked_engine(executable)
 
 
 def check_dependencies() -> None:
-    if not shutil.which(pandoc_bin()):
-        raise RuntimeError("Pandoc is missing. Install it with: sudo apt install pandoc")
-    for package, expected in {"markdownify": "0.14.1", "beautifulsoup4": "4.13.3"}.items():
-        if version(package) != expected:
-            raise RuntimeError(f"Expected {package}=={expected}. Run uv sync --locked.")
+    pandoc_bin()
 
 
-def run_command(
-    cmd: list[str], timeout: float = STAGE_TIMEOUT_SECONDS
-) -> subprocess.CompletedProcess:
+def _validate_epub(data: bytes) -> None:
+    if not data:
+        raise ConversionError("empty_file", "Upload a nonempty EPUB.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ConversionError("file_too_large", "EPUB exceeds 64 MiB.")
     try:
-        return subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", timeout=timeout
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ConversionError(
-            504, "conversion_timeout", "Conversion exceeded its time limit."
-        ) from exc
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            entries = archive.infolist()
+            names = archive.namelist()
+            if len(entries) > 10000 or sum(e.file_size for e in entries) > 256 * 1024 * 1024:
+                raise ValueError("Archive limits exceeded")
+            if len(names) != len(set(names)) or any(e.flag_bits & 1 for e in entries):
+                raise ValueError("Duplicate or encrypted members")
+            if archive.getinfo("mimetype").file_size > 64:
+                raise ValueError("Invalid mimetype")
+            if archive.read("mimetype").strip() != b"application/epub+zip":
+                raise ValueError("Invalid mimetype")
+            if archive.getinfo("META-INF/container.xml").file_size > 1024 * 1024:
+                raise ValueError("Oversized container metadata")
+            metadata = archive.read("META-INF/container.xml")
+            if b"<!DOCTYPE" in metadata.upper() or b"<!ENTITY" in metadata.upper():
+                raise ValueError("XML declarations are unsupported")
+            container = ElementTree.fromstring(metadata)
+            roots = container.findall(
+                ".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
+            )
+            if not roots or roots[0].get("full-path") not in names:
+                raise ValueError("Missing package document")
+    except (
+        zipfile.BadZipFile,
+        KeyError,
+        ValueError,
+        ElementTree.ParseError,
+        RuntimeError,
+        NotImplementedError,
+        OSError,
+    ) as exc:
+        raise ConversionError("invalid_epub", "File is not a supported, valid EPUB.") from exc
 
 
 def convert_epub(data: bytes) -> str:
-    if not data:
-        raise ConversionError(400, "empty_file", "Upload a nonempty EPUB.")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise ConversionError(413, "file_too_large", "EPUB exceeds 64 MiB.")
-    with TemporaryDirectory(prefix="epub-convert-") as directory:
-        epub, html, md = (Path(directory) / name for name in ("input.epub", "book.html", "book.md"))
-        epub.write_bytes(data)
-        validation = run_command([sys.executable, str(WORKER), "validate", str(epub)])
-        if validation.returncode:
-            raise ConversionError(
-                422,
-                "invalid_epub",
-                "File is not a supported, valid EPUB (archive limit: 256 MiB expanded / 10,000 entries).",
-            )
-        # Default HTML wrapping is intentional: it is part of the original workflow.
-        result = run_command(
+    """Convert in EPUB reading order, without extracting files or fetching resources.
+
+    Pandoc owns parsing and Markdown serialization. The bundled document filter
+    owns reading policy; neither transport rewrites the result.
+    """
+    _validate_epub(data)
+    try:
+        result = subprocess.run(
             [
                 pandoc_bin(),
                 "--sandbox",
                 "--from=epub",
-                "--to=html",
-                str(epub),
-                "--output",
-                str(html),
-            ]
+                "--to=gfm-raw_html-autolink_bare_uris",
+                "--wrap=none",
+                "--lua-filter=" + str(FILTER),
+            ],
+            input=data,
+            capture_output=True,
+            timeout=CONVERSION_TIMEOUT_SECONDS,
         )
-        if result.returncode:
-            raise ConversionError(
-                422,
-                "unreadable_epub",
-                "Pandoc could not read this EPUB. It may be damaged or DRM protected.",
-            )
-        result = run_command([sys.executable, str(WORKER), "render", str(html), str(md)])
-        if result.returncode:
-            raise RuntimeError(f"Markdown conversion failed: {result.stderr[:1000]}")
-        markdown = md.read_text(encoding="utf-8")
-        if not markdown.strip():
-            raise ConversionError(422, "empty_book", "No readable content was found in this EPUB.")
-        return markdown
+    except subprocess.TimeoutExpired as exc:
+        raise ConversionError("conversion_timeout", "Conversion exceeded its time limit.") from exc
+    except OSError as exc:
+        raise ConversionError("engine_unavailable", "Pandoc could not start.") from exc
+    if result.returncode:
+        raise ConversionError("unreadable_epub", "Pandoc could not read this EPUB.")
+    markdown = result.stdout.decode("utf-8")
+    if not markdown.strip():
+        raise ConversionError("empty_book", "No readable content was found in this EPUB.")
+    return markdown

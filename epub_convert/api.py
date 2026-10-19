@@ -15,19 +15,54 @@ logger = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
 
 
-async def bounded_body(request: Request) -> bytes:
+class UploadError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+
+async def read_upload(request: Request) -> tuple[str, bytes]:
+    media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if media_type not in {
+        "multipart/form-data",
+        "application/epub+zip",
+        "application/octet-stream",
+    }:
+        raise UploadError(
+            415, "unsupported_media_type", "Send an EPUB body or one multipart 'file'."
+        )
     try:
         declared_size = int(request.headers.get("content-length", "0"))
+        if declared_size < 0:
+            raise ValueError
     except ValueError as exc:
-        raise ConversionError(400, "invalid_content_length", "Invalid Content-Length.") from exc
+        raise UploadError(400, "invalid_content_length", "Invalid Content-Length.") from exc
     if declared_size > MAX_REQUEST_BYTES:
-        raise ConversionError(413, "file_too_large", "Request exceeds upload limit.")
-    chunks = bytearray()
-    async for chunk in request.stream():
-        if len(chunks) + len(chunk) > MAX_REQUEST_BYTES:
-            raise ConversionError(413, "file_too_large", "Request exceeds upload limit.")
-        chunks.extend(chunk)
-    return bytes(chunks)
+        raise UploadError(413, "file_too_large", "Request exceeds upload limit.")
+    received = 0
+
+    async def receive():
+        nonlocal received
+        message = await request.receive()
+        received += len(message.get("body", b""))
+        if received > MAX_REQUEST_BYTES:
+            raise UploadError(413, "file_too_large", "Request exceeds upload limit.")
+        return message
+
+    bounded = Request(request.scope, receive=receive)
+    if media_type != "multipart/form-data":
+        return "book.epub", await bounded.body()
+    try:
+        async with bounded.form(max_files=1, max_fields=0) as form:
+            files = form.getlist("file")
+            if len(files) != 1 or not isinstance(files[0], UploadFile):
+                raise UploadError(400, "missing_file", "Send exactly one EPUB in the 'file' field.")
+            data = await files[0].read(MAX_UPLOAD_BYTES + 1)
+            return files[0].filename or "book.epub", data
+    except (HTTPException, ValueError) as exc:
+        raise UploadError(
+            400, "invalid_multipart", "Send exactly one EPUB in the 'file' field."
+        ) from exc
 
 
 def download_name(filename: str) -> str:
@@ -43,10 +78,25 @@ def create_app(max_concurrent: int = 2) -> FastAPI:
         yield
 
     app = FastAPI(title="EPUB to Markdown", version=version("epub-convert"), lifespan=lifespan)
+    if max_concurrent < 1:
+        raise ValueError("max_concurrent must be positive")
     active = 0
 
     @app.exception_handler(ConversionError)
     async def conversion_error(request, exc):
+        status = {
+            "empty_file": 400,
+            "file_too_large": 413,
+            "invalid_epub": 422,
+            "unreadable_epub": 422,
+            "empty_book": 422,
+            "conversion_timeout": 504,
+            "engine_unavailable": 503,
+        }[exc.code]
+        return JSONResponse({"error": exc.code, "message": str(exc)}, status_code=status)
+
+    @app.exception_handler(UploadError)
+    async def upload_error(request, exc):
         return JSONResponse({"error": exc.code, "message": str(exc)}, status_code=exc.status)
 
     @app.get("/health")
@@ -89,44 +139,7 @@ def create_app(max_concurrent: int = 2) -> FastAPI:
             )
         active += 1
         try:
-            media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
-            if media_type not in {
-                "multipart/form-data",
-                "application/epub+zip",
-                "application/octet-stream",
-            }:
-                raise ConversionError(
-                    415,
-                    "unsupported_media_type",
-                    "Use multipart/form-data with a 'file' field, or application/epub+zip.",
-                )
-            body = await bounded_body(request)
-            filename = "book.epub"
-            if media_type == "multipart/form-data":
-
-                async def receive():
-                    return {"type": "http.request", "body": body, "more_body": False}
-
-                parsed = Request(request.scope, receive=receive)
-                try:
-                    async with parsed.form(max_files=1, max_fields=1) as form:
-                        files = form.getlist("file")
-                        if len(files) != 1 or not isinstance(files[0], UploadFile):
-                            raise ConversionError(
-                                400, "missing_file", "Send exactly one EPUB in the 'file' field."
-                            )
-                        filename = files[0].filename or filename
-                        if files[0].size and files[0].size > MAX_UPLOAD_BYTES:
-                            raise ConversionError(413, "file_too_large", "EPUB exceeds 64 MiB.")
-                        data = await files[0].read()
-                except (HTTPException, ValueError) as exc:
-                    raise ConversionError(
-                        400,
-                        "invalid_multipart",
-                        "Malformed multipart upload; send exactly one 'file'.",
-                    ) from exc
-            else:
-                data = body
+            filename, data = await read_upload(request)
             markdown = await run_in_threadpool(convert_epub, data)
             return Response(
                 markdown,
@@ -137,7 +150,7 @@ def create_app(max_concurrent: int = 2) -> FastAPI:
                     "X-Conversion-Pipeline": PIPELINE,
                 },
             )
-        except ConversionError:
+        except (ConversionError, UploadError):
             raise
         except Exception:
             logger.exception("Conversion failed")
