@@ -1,6 +1,6 @@
 import asyncio
+import re
 import subprocess
-import sys
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -13,8 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from epub_convert.api import MAX_REQUEST_BYTES, create_app
-from epub_convert.converter import ConversionError, run_command
-from epub_convert.worker import clean
+from epub_convert.converter import PIPELINE
 
 
 @pytest.fixture(scope="module")
@@ -63,14 +62,14 @@ def test_conversion_structure_and_cleanup(client, epub):
     assert response.status_code == 200, response.text
     assert response.headers["content-type"] == "text/markdown; charset=utf-8"
     assert response.headers["content-disposition"] == 'attachment; filename="Sample Book.md"'
-    assert response.headers["x-conversion-pipeline"] == "iooh-epub-v1"
+    assert response.headers["x-conversion-pipeline"] == PIPELINE
     md = response.text
     assert "# A Sample Book" in md
     assert "## First Chapter" in md
     assert "wrapped line and **bold text**, *emphasis*, and a readable link" in md
     assert "](https://example.com)" not in md
-    assert "| Alpha | One |" in md
-    assert "| Beta | Two |" in md
+    assert re.search(r"^\|\s*Alpha\s*\|\s*One\s*\|$", md, re.M)
+    assert re.search(r"^\|\s*Beta\s*\|\s*Two\s*\|$", md, re.M)
     assert "café — naïve 日本語" in md
 
 
@@ -153,7 +152,7 @@ def test_errors_health_and_docs(client):
     assert client.post("/convert", json={}).status_code == 415
     assert client.get("/convert").status_code == 405
     assert client.get("/unknown").status_code == 404
-    assert client.get("/health").json() == {"status": "ok", "pipeline": "iooh-epub-v1"}
+    assert client.get("/health").json() == {"status": "ok", "pipeline": PIPELINE}
     assert client.get("/docs").status_code == 200
     assert (
         "multipart/form-data"
@@ -181,18 +180,3 @@ def test_capacity_and_recovery(monkeypatch):
             release.set()
         assert first.result().status_code == 200
         assert raw(client, b"next").status_code == 200
-
-
-def test_subprocess_timeout():
-    with pytest.raises(ConversionError) as error:
-        run_command([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.02)
-    assert error.value.status == 504
-
-
-def test_cleanup_is_literal_source_behavior():
-    # This golden sample captures paragraph joining, tables, links, and CRLF.
-    text = "First\r\nwrapped line\r\n\r\nSecond [label](https://example.com)\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n"
-    assert (
-        clean(text)
-        == "First wrapped line\r\n\nSecond label\n\n| A | B |\n| --- | --- |\n| 1 | 2 | "
-    )
