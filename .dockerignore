@@ -1,0 +1,10 @@
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!epub_convert/
+!epub_convert/*.py
+!tests/
+!tests/*.py
+!scripts/
+!scripts/*.py

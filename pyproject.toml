@@ -1,6 +1,6 @@
 [project]
 name = "epub-convert"
-version = "1.0.0"
+version = "0.1.0"
 description = "EPUB to Markdown API preserving the iooh-epub conversion pipeline"
 readme = "README.md"
 requires-python = ">=3.12"

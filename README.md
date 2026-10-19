@@ -101,3 +101,24 @@ fresh Pandoc includes those notes, producing 633,493 bytes versus the historical
 the historical output. The scripts do not record a note-removal step, so the API
 preserves the notes Pandoc produces. Historical-file agreement is reported
 separately from agreement with the executable source pipeline.
+
+## Container image
+
+GitHub Actions tests the image and a real HTTP conversion before publishing
+`ghcr.io/bioshazard/epub-convert` for `linux/amd64` and `linux/arm64`.
+Release tags publish `v0.1.0`, `0.1.0`, SHA and `latest` tags (with the
+version taken from each tag). Main pushes and pull requests test without
+publishing. Base images and Actions are pinned by digest/commit.
+
+```sh
+docker build -t epub-convert:local .
+python3 scripts/smoke_image.py epub-convert:local
+docker run --rm --read-only --tmpfs /tmp:rw,nosuid,noexec,size=256m \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  -p 127.0.0.1:3000:3000 ghcr.io/bioshazard/epub-convert:v0.1.0
+```
+
+The runtime includes Pandoc, runs as UID/GID 10001, and uses temporary request
+storage only. Bind the host port to loopback unless placing it behind your own
+authenticating gateway. Private GHCR packages require `docker login ghcr.io`.
+The Docker build context allowlist excludes credentials and book artifacts.

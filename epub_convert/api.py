@@ -1,6 +1,7 @@
 import logging
 import re
 from contextlib import asynccontextmanager
+from importlib.metadata import version
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -41,7 +42,7 @@ def create_app(max_concurrent: int = 2) -> FastAPI:
         check_dependencies()
         yield
 
-    app = FastAPI(title="EPUB to Markdown", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="EPUB to Markdown", version=version("epub-convert"), lifespan=lifespan)
     active = 0
 
     @app.exception_handler(ConversionError)

@@ -1,0 +1,88 @@
+name: Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, tomllib
+          with open('pyproject.toml', 'rb') as f:
+              version = tomllib.load(f)['project']['version']
+          assert os.environ['RELEASE_REF'] == 'v' + version, 'Tag must match package version'
+          PYTHON
+      - name: Build test image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: test
+          load: true
+          tags: epub-convert:test
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=test
+      - name: Test
+        run: docker run --rm epub-convert:test
+      - name: Build runtime for smoke check
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: epub-convert:smoke
+          cache-from: type=gha,scope=test
+      - name: Smoke check shipped runtime
+        run: python3 scripts/smoke_image.py epub-convert:smoke
+      - name: Image tags
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=sha
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish amd64 and arm64
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=runtime
+          provenance: mode=min
+          sbom: true

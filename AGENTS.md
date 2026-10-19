@@ -9,3 +9,6 @@
 - `scripts/verify_source.py` optionally compares original source books/scripts, which
   live in the sibling `iooh-epub` project on bios-kubuntu and are not bundled here.
 - Never commit EPUBs, PDFs, conversion artifacts, credentials or environment files.
+- Dockerfile uses pinned Python/uv images, sandboxed Pandoc and non-root UID 10001.
+- Image CI tests and smoke-converts before GHCR publication (amd64/arm64).
+- Release version in pyproject.toml/uv.lock must match the Git vX.Y.Z tag.
