@@ -1,0 +1,10 @@
+.venv/
+artifacts/
+.env*
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+*.epub
+*.pdf

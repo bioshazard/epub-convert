@@ -1,0 +1,36 @@
+[project]
+name = "epub-convert"
+version = "1.0.0"
+description = "EPUB to Markdown API preserving the iooh-epub conversion pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "python-multipart>=0.0.20,<1",
+    # Exact versions from iooh-epub/convert-epub-md/uv.lock.
+    "markdownify==0.14.1",
+    "beautifulsoup4==4.13.3",
+    "six==1.17.0",
+    "soupsieve==2.6",
+    "typing-extensions==4.12.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx>=0.28,<1", "ruff>=0.11,<1"]
+
+[project.scripts]
+epub-convert = "epub_convert.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
